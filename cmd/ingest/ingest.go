@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes" // Ajout pour les requêtes HTTP
 	"context"
+	"encoding/json" // Ajout pour le JSON
 	"fmt"
 	"log"
+	"net/http" // Ajout pour le client HTTP
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +15,6 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 
 	chroma "github.com/amikos-tech/chroma-go/pkg/api/v2"
-	// ON A BESOIN DE CE NOUVEAU PACKAGE POUR L'INTERFACE
 	"github.com/amikos-tech/chroma-go/pkg/embeddings"
 )
 
@@ -23,15 +25,23 @@ type Document struct {
 }
 
 func main() {
-	// ... (Toutes les sections précédentes sont maintenant correctes)
+	// --- AJOUT : Un simple booléen pour choisir notre moteur d'embedding ---
+	useGemmaLocal := true
+	// ---------------------------------------------------------------------
+
 	if err := godotenv.Load(".env"); err != nil {
 		log.Fatalf("Erreur chargement .env: %v", err)
 	}
 	openaiAPIKey := os.Getenv("OPENAI_API_KEY")
 	chromaURL := os.Getenv("CHROMA_DB_URL")
-	if openaiAPIKey == "" || chromaURL == "" {
-		log.Fatal("OPENAI_API_KEY et CHROMA_DB_URL doivent être définis")
+	// MODIFICATION : On ne quitte que si on a besoin de la clé OpenAI
+	if !useGemmaLocal && openaiAPIKey == "" {
+		log.Fatal("OPENAI_API_KEY doit être défini pour utiliser OpenAI")
 	}
+	if chromaURL == "" {
+		log.Fatal("CHROMA_DB_URL doit être défini")
+	}
+
 	fmt.Println("🚀 Démarrage du script d'ingestion...")
 	ctx := context.Background()
 	docs, err := loadDocuments("./data")
@@ -39,20 +49,32 @@ func main() {
 		log.Fatalf("Erreur lecture documents: %v", err)
 	}
 	fmt.Printf("   - %d documents trouvés\n", len(docs))
-	openaiClient := openai.NewClient(openaiAPIKey)
+
+	// MODIFICATION : On crée le client Chroma directement
 	chromaClient, err := chroma.NewHTTPClient(chroma.WithBaseURL(chromaURL))
 	if err != nil {
 		log.Fatalf("Erreur client Chroma: %v", err)
 	}
+
+	// --- AJOUT : Logique pour sélectionner la fonction d'embedding ---
+	var embeddingFunc embeddings.EmbeddingFunction
+
+	if useGemmaLocal {
+		fmt.Println("   - Utilisation du moteur d'embedding local (Gemma-like)")
+		embeddingFunc = NewGemmaEmbeddingFunction("http://localhost:5001/embed")
+	} else {
+		fmt.Println("   - Utilisation du moteur d'embedding OpenAI")
+		openaiClient := openai.NewClient(openaiAPIKey)
+		embeddingFunc = NewOpenAIEmbeddingFunction(openaiClient)
+	}
+	// -------------------------------------------------------------
+
 	collectionName := "novabot-rh"
 	fmt.Printf("   - Préparation de la collection Chroma '%s'...\n", collectionName)
 	err = chromaClient.DeleteCollection(ctx, collectionName)
 	if err != nil {
 		log.Printf("Avertissement: collection non supprimée (elle n'existait peut-être pas): %v", err)
 	}
-
-	// Cette ligne est maintenant correcte car NewOpenAIEmbeddingFunction va retourner le bon type
-	embeddingFunc := NewOpenAIEmbeddingFunction(openaiClient)
 
 	col, err := chromaClient.GetOrCreateCollection(
 		ctx,
@@ -63,10 +85,11 @@ func main() {
 		log.Fatalf("Erreur création collection: %v", err)
 	}
 
-	// ... (le reste de la fonction main est correct)
 	fmt.Println("   - Vectorisation et ajout des documents...")
+
+	// MODIFICATION : Correction des types pour l'appel Add
 	texts := make([]string, len(docs))
-	docMetadatas := make([]chroma.DocumentMetadata, len(docs))
+	metadatas := make([]chroma.DocumentMetadata, len(docs))
 	ids := make([]chroma.DocumentID, len(docs))
 	for i, doc := range docs {
 		texts[i] = doc.Text
@@ -77,18 +100,18 @@ func main() {
 				attributes = append(attributes, chroma.NewStringAttribute(key, v))
 			}
 		}
-		docMetadatas[i] = chroma.NewDocumentMetadata(attributes...)
+		metadatas[i] = chroma.NewDocumentMetadata(attributes...)
 	}
-	err = col.Add(ctx, chroma.WithIDs(ids...), chroma.WithMetadatas(docMetadatas...), chroma.WithTexts(texts...))
+
+	err = col.Add(ctx, chroma.WithIDs(ids...), chroma.WithMetadatas(metadatas...), chroma.WithTexts(texts...))
 	if err != nil {
 		log.Fatalf("Erreur ajout documents: %v", err)
 	}
 	fmt.Println("✅ Ingestion terminée avec succès !")
 }
 
-// loadDocuments (inchangé)
+// loadDocuments (inchangé, c'est votre version)
 func loadDocuments(dir string) ([]Document, error) {
-	// ...
 	var documents []Document
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".md") {
@@ -105,7 +128,7 @@ func loadDocuments(dir string) ([]Document, error) {
 }
 
 // ##################################################################
-// # SECTION ENTIÈREMENT MISE À JOUR POUR SATISFAIRE LA BONNE INTERFACE #
+// # SECTION OPENAI (INCHANGÉE, C'EST VOTRE VERSION)                #
 // ##################################################################
 
 type openaiEmbeddingFunction struct {
@@ -118,18 +141,14 @@ func NewOpenAIEmbeddingFunction(client *openai.Client) embeddings.EmbeddingFunct
 	return &openaiEmbeddingFunction{apiClient: client}
 }
 
-// La méthode retourne maintenant `[]embeddings.Embedding`
 func (e *openaiEmbeddingFunction) EmbedDocuments(ctx context.Context, docs []string) ([]embeddings.Embedding, error) {
-	fmt.Printf("   - Création d'embeddings pour %d documents...\n", len(docs))
+	fmt.Printf("   - [OpenAI] Création d'embeddings pour %d documents...\n", len(docs))
 	resp, err := e.apiClient.CreateEmbeddings(ctx, &openai.EmbeddingRequest{Input: docs, Model: openai.AdaEmbeddingV2})
 	if err != nil {
 		return nil, err
 	}
-
-	// On crée une slice du bon type de retour
 	results := make([]embeddings.Embedding, len(resp.Data))
 	for i, data := range resp.Data {
-		// On convertit chaque `[]float32` en `embeddings.Embedding`
 		results[i] = embeddings.NewEmbeddingFromFloat32(data.Embedding)
 	}
 	return results, nil
@@ -138,11 +157,91 @@ func (e *openaiEmbeddingFunction) EmbedDocuments(ctx context.Context, docs []str
 func (e *openaiEmbeddingFunction) EmbedQuery(ctx context.Context, query string) (embeddings.Embedding, error) {
 	resp, err := e.apiClient.CreateEmbeddings(ctx, &openai.EmbeddingRequest{Input: []string{query}, Model: openai.AdaEmbeddingV2})
 	if err != nil {
-		// --- DÉBUT DE LA CORRECTION ---
-		// La valeur "zéro" d'une interface est `nil`
 		return nil, err
-		// --- FIN DE LA CORRECTION ---
 	}
 	result := embeddings.NewEmbeddingFromFloat32(resp.Data[0].Embedding)
+	return result, nil
+}
+
+// ##################################################################
+// # AJOUT : SECTION GEMMA-LIKE LOCALE                              #
+// ##################################################################
+
+type gemmaEmbeddingFunction struct {
+	serverURL  string
+	httpClient *http.Client
+}
+
+var _ embeddings.EmbeddingFunction = (*gemmaEmbeddingFunction)(nil)
+
+func NewGemmaEmbeddingFunction(url string) embeddings.EmbeddingFunction {
+	return &gemmaEmbeddingFunction{
+		serverURL:  url,
+		httpClient: &http.Client{},
+	}
+}
+
+type embedRequest struct {
+	Texts []string `json:"texts"`
+}
+
+type embedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+}
+
+func (e *gemmaEmbeddingFunction) embed(texts []string) ([][]float32, error) {
+	reqBody, err := json.Marshal(embedRequest{Texts: texts})
+	if err != nil {
+		return nil, fmt.Errorf("erreur JSON marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST", e.serverURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("erreur création requête HTTP: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("erreur appel serveur local: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("le serveur d'embedding a renvoyé une erreur (%s)", resp.Status)
+	}
+
+	var embedResp embedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
+		return nil, fmt.Errorf("erreur JSON decode: %w", err)
+	}
+
+	return embedResp.Embeddings, nil
+}
+
+func (e *gemmaEmbeddingFunction) EmbedDocuments(ctx context.Context, docs []string) ([]embeddings.Embedding, error) {
+	fmt.Printf("   - [Local] Création d'embeddings pour %d documents...\n", len(docs))
+	floatEmbeddings, err := e.embed(docs)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]embeddings.Embedding, len(floatEmbeddings))
+	for i, data := range floatEmbeddings {
+		results[i] = embeddings.NewEmbeddingFromFloat32(data)
+	}
+	return results, nil
+}
+
+func (e *gemmaEmbeddingFunction) EmbedQuery(ctx context.Context, query string) (embeddings.Embedding, error) {
+	floatEmbeddings, err := e.embed([]string{query})
+	if err != nil {
+		return nil, err
+	}
+	if len(floatEmbeddings) == 0 {
+		return nil, fmt.Errorf("le serveur d'embedding n'a renvoyé aucun vecteur")
+	}
+
+	result := embeddings.NewEmbeddingFromFloat32(floatEmbeddings[0])
 	return result, nil
 }
