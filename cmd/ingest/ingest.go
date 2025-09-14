@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes" // Ajout pour les requêtes HTTP
 	"context"
-	"encoding/json" // Ajout pour le JSON
 	"fmt"
+	embedders "github.com/Zuful/novabot/internal/embeddings"
 	"log"
-	"net/http" // Ajout pour le client HTTP
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,7 +59,7 @@ func main() {
 
 	if useGemmaLocal {
 		fmt.Println("   - Utilisation du moteur d'embedding local (Gemma-like)")
-		embeddingFunc = NewGemmaEmbeddingFunction("http://localhost:5001/embed")
+		embeddingFunc = embedders.NewGemmaEmbeddingFunction("http://localhost:5001/embed")
 	} else {
 		fmt.Println("   - Utilisation du moteur d'embedding OpenAI")
 		openaiClient := openai.NewClient(openaiAPIKey)
@@ -160,88 +158,5 @@ func (e *openaiEmbeddingFunction) EmbedQuery(ctx context.Context, query string) 
 		return nil, err
 	}
 	result := embeddings.NewEmbeddingFromFloat32(resp.Data[0].Embedding)
-	return result, nil
-}
-
-// ##################################################################
-// # AJOUT : SECTION GEMMA-LIKE LOCALE                              #
-// ##################################################################
-
-type gemmaEmbeddingFunction struct {
-	serverURL  string
-	httpClient *http.Client
-}
-
-var _ embeddings.EmbeddingFunction = (*gemmaEmbeddingFunction)(nil)
-
-func NewGemmaEmbeddingFunction(url string) embeddings.EmbeddingFunction {
-	return &gemmaEmbeddingFunction{
-		serverURL:  url,
-		httpClient: &http.Client{},
-	}
-}
-
-type embedRequest struct {
-	Texts []string `json:"texts"`
-}
-
-type embedResponse struct {
-	Embeddings [][]float32 `json:"embeddings"`
-}
-
-func (e *gemmaEmbeddingFunction) embed(texts []string) ([][]float32, error) {
-	reqBody, err := json.Marshal(embedRequest{Texts: texts})
-	if err != nil {
-		return nil, fmt.Errorf("erreur JSON marshal: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(context.Background(), "POST", e.serverURL, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("erreur création requête HTTP: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("erreur appel serveur local: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("le serveur d'embedding a renvoyé une erreur (%s)", resp.Status)
-	}
-
-	var embedResp embedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
-		return nil, fmt.Errorf("erreur JSON decode: %w", err)
-	}
-
-	return embedResp.Embeddings, nil
-}
-
-func (e *gemmaEmbeddingFunction) EmbedDocuments(ctx context.Context, docs []string) ([]embeddings.Embedding, error) {
-	fmt.Printf("   - [Local] Création d'embeddings pour %d documents...\n", len(docs))
-	floatEmbeddings, err := e.embed(docs)
-	if err != nil {
-		return nil, err
-	}
-
-	results := make([]embeddings.Embedding, len(floatEmbeddings))
-	for i, data := range floatEmbeddings {
-		results[i] = embeddings.NewEmbeddingFromFloat32(data)
-	}
-	return results, nil
-}
-
-func (e *gemmaEmbeddingFunction) EmbedQuery(ctx context.Context, query string) (embeddings.Embedding, error) {
-	floatEmbeddings, err := e.embed([]string{query})
-	if err != nil {
-		return nil, err
-	}
-	if len(floatEmbeddings) == 0 {
-		return nil, fmt.Errorf("le serveur d'embedding n'a renvoyé aucun vecteur")
-	}
-
-	result := embeddings.NewEmbeddingFromFloat32(floatEmbeddings[0])
 	return result, nil
 }
