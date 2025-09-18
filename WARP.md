@@ -17,7 +17,7 @@ This project implements a microservices architecture with clear separation of co
            |   └── Extracts text from documents (PDF, Word, etc.)
            |
            ├── Embedding Service (port 5001) 
-           |   └── Python Flask server using SentenceTransformers
+           |   └── Standalone Python microservice using SentenceTransformers
            |
            ├── Embeddingestion Service (port 8081)
            |   └── Stores vectors in ChromaDB with metadata
@@ -62,8 +62,8 @@ go build -o bin/ticket-tool ./cmd/ticket-tool
 # Download Go dependencies
 go mod tidy
 
-# Start the Python embedding server (Flask)
-python3 embed_server.py
+# Start the Embedding Service (from separate project)
+cd ../embedding-service && python embedding_server.py
 
 # Start external services with Docker Compose
 docker-compose up -d chromadb
@@ -91,7 +91,7 @@ go fmt ./...
 ### Full System Startup Sequence
 
 1. **Start ChromaDB**: `docker-compose up -d chromadb` (or ensure it's running on port 8000)
-2. **Start Python embedding server**: `python3 embed_server.py` (port 5001)  
+2. **Start Embedding Service**: Navigate to `../embedding-service` and run `python embedding_server.py` (port 5001)
 3. **Start DocParser service**: Ensure it's running on port 8080
 4. **Start Embeddingestion service**: Ensure it's running on port 8081
 5. **Run document ingestion**: `go run ./cmd/ingest` (processes `./data` directory)
@@ -149,7 +149,6 @@ Custom embedding function (`GemmaEmbeddingFunction`) implements ChromaDB's `Embe
 - `internal/embeddings/`: ChromaDB embedding function implementation  
 - `internal/mcp/`: Model Context Protocol tool implementation
 - `data/`: Sample documents for ingestion
-- `embed_server.py`: Python Flask embedding service
 
 ## Dependencies
 
@@ -166,5 +165,6 @@ Custom embedding function (`GemmaEmbeddingFunction`) implements ChromaDB's `Embe
 
 This orchestrator is designed to work with separate microservices that may be located in sibling directories:
 - DocParser service (separate Go microservice)
+- Embedding service (separate Python microservice)
 - Embeddingestion service (separate Go microservice)
 - External services via Docker Compose or direct installation
