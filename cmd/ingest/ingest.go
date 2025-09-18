@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,14 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
-	// Votre import est correct
-	embedders "github.com/Zuful/novabot/internal/embeddings"
-
-	chroma "github.com/amikos-tech/chroma-go/pkg/api/v2"
-	"github.com/amikos-tech/chroma-go/pkg/embeddings"
 	"github.com/joho/godotenv"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 // La structure Document ne change pas
@@ -30,6 +24,36 @@ type Document struct {
 // La structure de la réponse que nous attendons de notre service DocParser
 type DocParserResponse struct {
 	Content string `json:"content"`
+}
+
+// Structure pour l'embedding service
+type EmbeddingRequest struct {
+	Texts []string `json:"texts"`
+}
+
+type EmbeddingResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+}
+
+// Structures pour l'embeddingestion service
+type VectorDocument struct {
+	ID       string                 `json:"id"`
+	Vectors  []float32             `json:"vectors"`
+	Text     string                `json:"text,omitempty"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+type StoreVectorsRequest struct {
+	CollectionName string            `json:"collection_name"`
+	Documents      []VectorDocument  `json:"documents"`
+}
+
+type StorageResponse struct {
+	Success        bool   `json:"success"`
+	Message        string `json:"message"`
+	DocumentsCount int    `json:"documents_count,omitempty"`
+	CollectionName string `json:"collection_name,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 // ------------------------------------------------------------------
@@ -117,121 +141,153 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 	return documents, nil
 }
 
+// callEmbeddingService génère les embeddings via le service d'embedding
+func callEmbeddingService(texts []string, embeddingURL string) ([][]float32, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	fmt.Printf("   - Génération des embeddings pour %d documents via le service d'embedding...\n", len(texts))
+
+	reqBody, err := json.Marshal(EmbeddingRequest{Texts: texts})
+	if err != nil {
+		return nil, fmt.Errorf("erreur marshalling JSON: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", embeddingURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("erreur création requête: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("erreur appel service d'embedding: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("service d'embedding a retourné une erreur (%s)", resp.Status)
+	}
+
+	var embeddingResp EmbeddingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
+		return nil, fmt.Errorf("erreur décodage réponse: %w", err)
+	}
+
+	fmt.Printf("   - Embeddings générés avec succès pour %d documents\n", len(embeddingResp.Embeddings))
+	return embeddingResp.Embeddings, nil
+}
+
+// storeVectors stocke les vecteurs via l'embeddingestion service
+func storeVectors(documents []VectorDocument, collectionName, embeddingestionURL string) error {
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	fmt.Printf("   - Stockage de %d documents vectorisés dans la collection '%s'...\n", len(documents), collectionName)
+
+	reqBody, err := json.Marshal(StoreVectorsRequest{
+		CollectionName: collectionName,
+		Documents:      documents,
+	})
+	if err != nil {
+		return fmt.Errorf("erreur marshalling JSON: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", embeddingestionURL+"/api/v1/vectors", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("erreur création requête: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("erreur appel embeddingestion service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var storageResp StorageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&storageResp); err != nil {
+		return fmt.Errorf("erreur décodage réponse: %w", err)
+	}
+
+	if !storageResp.Success {
+		return fmt.Errorf("embeddingestion service a retourné une erreur: %s", storageResp.Error)
+	}
+
+	fmt.Printf("   - Stockage réussi: %s (%d documents)\n", storageResp.Message, storageResp.DocumentsCount)
+	return nil
+}
+
 // ------------------------------------------------------------------
 
 func main() {
-	useGemmaLocal := true // Gardé pour la cohérence, même si OpenAI n'est plus utilisé ici
-
 	if err := godotenv.Load(".env"); err != nil {
 		log.Fatalf("Erreur chargement .env: %v", err)
 	}
-	chromaURL := os.Getenv("CHROMA_DB_URL")
-	if chromaURL == "" {
-		log.Fatal("CHROMA_DB_URL doit être défini")
-	}
 
-	fmt.Println("🚀 Démarrage du script d'ingestion...")
-	ctx := context.Background()
+	// Configuration des URLs des microservices
+	docParserURL := getEnvWithDefault("DOC_PARSER_URL", "http://localhost:8080/parse")
+	embeddingURL := getEnvWithDefault("EMBEDDING_URL", "http://localhost:5001/embed")
+	embeddingestionURL := getEnvWithDefault("EMBEDDINGESTION_URL", "http://localhost:8081")
+	collectionName := getEnvWithDefault("COLLECTION_NAME", "novabot-rh")
 
-	// --- MODIFICATION : On appelle la nouvelle fonction loadDocuments ---
-	docs, err := loadDocuments("./data", "http://localhost:8080/parse")
+	fmt.Println("🚀 Démarrage de l'orchestrateur d'ingestion...")
+	fmt.Println("   - DocParser:", docParserURL)
+	fmt.Println("   - Embedding Service:", embeddingURL)
+	fmt.Println("   - Embeddingestion Service:", embeddingestionURL)
+	fmt.Println("   - Collection:", collectionName)
+
+	// ÉTAPE 1: Parser les documents via DocParser
+	fmt.Println("\n📄 ÉTAPE 1: Parsing des documents...")
+	docs, err := loadDocuments("./data", docParserURL)
 	if err != nil {
-		log.Fatalf("Le script d'ingestion a échoué: %v", err)
+		log.Fatalf("Erreur lors du parsing: %v", err)
 	}
-	// -------------------------------------------------------------------
 
 	if len(docs) == 0 {
-		log.Fatal("Aucun document n'a pu être traité. Vérifiez que le service DocParser est bien lancé et que le dossier /data contient des fichiers valides.")
+		log.Fatal("Aucun document traité. Vérifiez que DocParser est lancé et que /data contient des fichiers.")
 	}
-	fmt.Printf("   - %d documents ont été traités avec succès par DocParser.\n", len(docs))
+	fmt.Printf("   ✅ %d documents parsés avec succès\n", len(docs))
 
-	// Le reste de votre code est 100% identique à votre version
-	chromaClient, err := chroma.NewHTTPClient(chroma.WithBaseURL(chromaURL))
-	if err != nil {
-		log.Fatalf("Erreur client Chroma: %v", err)
-	}
-
-	var embeddingFunc embeddings.EmbeddingFunction
-	if useGemmaLocal {
-		fmt.Println("   - Utilisation du moteur d'embedding local (Gemma-like)")
-		embeddingFunc = embedders.NewGemmaEmbeddingFunction("http://localhost:5001/embed")
-	} else {
-		fmt.Println("   - Utilisation du moteur d'embedding OpenAI")
-		openaiAPIKey := os.Getenv("OPENAI_API_KEY")
-		if openaiAPIKey == "" {
-			log.Fatal("OPENAI_API_KEY doit être défini pour utiliser OpenAI")
-		}
-		openaiClient := openai.NewClient(openaiAPIKey)
-		embeddingFunc = NewOpenAIEmbeddingFunction(openaiClient)
-	}
-
-	collectionName := "novabot-rh"
-	fmt.Printf("   - Préparation de la collection Chroma '%s'...\n", collectionName)
-	err = chromaClient.DeleteCollection(ctx, collectionName)
-	if err != nil {
-		log.Printf("Avertissement: collection non supprimée (elle n'existait peut-être pas): %v", err)
-	}
-
-	col, err := chromaClient.GetOrCreateCollection(
-		ctx,
-		collectionName,
-		chroma.WithEmbeddingFunctionCreate(embeddingFunc),
-	)
-	if err != nil {
-		log.Fatalf("Erreur création collection: %v", err)
-	}
-
-	fmt.Println("   - Vectorisation et ajout des documents à ChromaDB...")
+	// ÉTAPE 2: Générer les embeddings via le service d'embedding
+	fmt.Println("\n🧠 ÉTAPE 2: Génération des embeddings...")
 	texts := make([]string, len(docs))
-	metadatas := make([]chroma.DocumentMetadata, len(docs))
-	ids := make([]chroma.DocumentID, len(docs))
 	for i, doc := range docs {
 		texts[i] = doc.Text
-		ids[i] = chroma.DocumentID(fmt.Sprintf("doc_%d", i))
-		attributes := make([]*chroma.MetaAttribute, 0, len(doc.Metadata))
-		for key, value := range doc.Metadata {
-			if v, ok := value.(string); ok {
-				attributes = append(attributes, chroma.NewStringAttribute(key, v))
-			}
+	}
+
+	embeddings, err := callEmbeddingService(texts, embeddingURL)
+	if err != nil {
+		log.Fatalf("Erreur lors de la génération des embeddings: %v", err)
+	}
+	fmt.Printf("   ✅ Embeddings générés pour %d documents\n", len(embeddings))
+
+	// ÉTAPE 3: Préparer les VectorDocuments pour le stockage
+	fmt.Println("\n💾 ÉTAPE 3: Préparation des documents vectorisés...")
+	vectorDocs := make([]VectorDocument, len(docs))
+	for i, doc := range docs {
+		vectorDocs[i] = VectorDocument{
+			ID:       fmt.Sprintf("doc_%d_%d", time.Now().Unix(), i),
+			Vectors:  embeddings[i],
+			Text:     doc.Text,
+			Metadata: doc.Metadata,
 		}
-		metadatas[i] = chroma.NewDocumentMetadata(attributes...)
 	}
+	fmt.Printf("   ✅ %d documents vectorisés prêts pour le stockage\n", len(vectorDocs))
 
-	err = col.Add(ctx, chroma.WithIDs(ids...), chroma.WithMetadatas(metadatas...), chroma.WithTexts(texts...))
+	// ÉTAPE 4: Stocker via l'embeddingestion service
+	fmt.Println("\n📍 ÉTAPE 4: Stockage des vecteurs...")
+	err = storeVectors(vectorDocs, collectionName, embeddingestionURL)
 	if err != nil {
-		log.Fatalf("Erreur ajout documents: %v", err)
+		log.Fatalf("Erreur lors du stockage: %v", err)
 	}
-	fmt.Println("✅ Ingestion terminée avec succès !")
+
+	fmt.Println("\n✅ Orchestration terminée avec succès !")
+	fmt.Printf("   - %d documents traités et stockés dans la collection '%s'\n", len(docs), collectionName)
 }
 
-// La section OpenAI est conservée car votre code la référence, même si elle n'est pas
-// utilisée quand `useGemmaLocal` est `true`.
-type openaiEmbeddingFunction struct {
-	apiClient *openai.Client
+func getEnvWithDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }
 
-var _ embeddings.EmbeddingFunction = (*openaiEmbeddingFunction)(nil)
-
-func NewOpenAIEmbeddingFunction(client *openai.Client) embeddings.EmbeddingFunction {
-	return &openaiEmbeddingFunction{apiClient: client}
-}
-func (e *openaiEmbeddingFunction) EmbedDocuments(ctx context.Context, docs []string) ([]embeddings.Embedding, error) {
-	fmt.Printf("   - [OpenAI] Création d'embeddings pour %d documents...\n", len(docs))
-	resp, err := e.apiClient.CreateEmbeddings(ctx, &openai.EmbeddingRequest{Input: docs, Model: openai.AdaEmbeddingV2})
-	if err != nil {
-		return nil, err
-	}
-	results := make([]embeddings.Embedding, len(resp.Data))
-	for i, data := range resp.Data {
-		results[i] = embeddings.NewEmbeddingFromFloat32(data.Embedding)
-	}
-	return results, nil
-}
-func (e *openaiEmbeddingFunction) EmbedQuery(ctx context.Context, query string) (embeddings.Embedding, error) {
-	resp, err := e.apiClient.CreateEmbeddings(ctx, &openai.EmbeddingRequest{Input: []string{query}, Model: openai.AdaEmbeddingV2})
-	if err != nil {
-		return nil, err
-	}
-	result := embeddings.NewEmbeddingFromFloat32(resp.Data[0].Embedding)
-	return result, nil
-}
