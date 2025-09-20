@@ -141,40 +141,61 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 	return documents, nil
 }
 
-// callEmbeddingService génère les embeddings via le service d'embedding
+// callEmbeddingService génère les embeddings via le service d'embedding avec traitement par batches
 func callEmbeddingService(texts []string, embeddingURL string) ([][]float32, error) {
-	client := &http.Client{Timeout: 300 * time.Second} // 5 minutes for embedding generation
+	client := &http.Client{Timeout: 60 * time.Second} // 1 minute per batch
+	batchSize := 3 // Process 3 documents at a time
 
-	fmt.Printf("   - Génération des embeddings pour %d documents via le service d'embedding...\n", len(texts))
+	fmt.Printf("   - Génération des embeddings pour %d documents (par batches de %d)...\n", len(texts), batchSize)
 
-	reqBody, err := json.Marshal(EmbeddingRequest{Texts: texts})
-	if err != nil {
-		return nil, fmt.Errorf("erreur marshalling JSON: %w", err)
+	var allEmbeddings [][]float32
+
+	for i := 0; i < len(texts); i += batchSize {
+		end := i + batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+
+		batch := texts[i:end]
+		batchNum := (i / batchSize) + 1
+		totalBatches := (len(texts) + batchSize - 1) / batchSize
+
+		fmt.Printf("     > Traitement du batch %d/%d (%d documents)...\n", batchNum, totalBatches, len(batch))
+
+		// Process this batch
+		reqBody, err := json.Marshal(EmbeddingRequest{Texts: batch})
+		if err != nil {
+			return nil, fmt.Errorf("erreur marshalling JSON batch %d: %w", batchNum, err)
+		}
+
+		req, err := http.NewRequest("POST", embeddingURL, bytes.NewBuffer(reqBody))
+		if err != nil {
+			return nil, fmt.Errorf("erreur création requête batch %d: %w", batchNum, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("erreur appel service d'embedding batch %d: %w", batchNum, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("service d'embedding a retourné une erreur (%s) pour batch %d", resp.Status, batchNum)
+		}
+
+		var embeddingResp EmbeddingResponse
+		if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
+			return nil, fmt.Errorf("erreur décodage réponse batch %d: %w", batchNum, err)
+		}
+
+		// Add embeddings from this batch to our results
+		allEmbeddings = append(allEmbeddings, embeddingResp.Embeddings...)
+		fmt.Printf("     ✅ Batch %d/%d terminé (%d embeddings générés)\n", batchNum, totalBatches, len(embeddingResp.Embeddings))
 	}
 
-	req, err := http.NewRequest("POST", embeddingURL, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("erreur création requête: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("erreur appel service d'embedding: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("service d'embedding a retourné une erreur (%s)", resp.Status)
-	}
-
-	var embeddingResp EmbeddingResponse
-	if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
-		return nil, fmt.Errorf("erreur décodage réponse: %w", err)
-	}
-
-	fmt.Printf("   - Embeddings générés avec succès pour %d documents\n", len(embeddingResp.Embeddings))
-	return embeddingResp.Embeddings, nil
+	fmt.Printf("   ✅ Tous les embeddings générés avec succès (%d documents total)\n", len(allEmbeddings))
+	return allEmbeddings, nil
 }
 
 // storeVectors stocke les vecteurs via l'embeddingestion service
