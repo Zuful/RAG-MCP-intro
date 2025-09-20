@@ -40,6 +40,7 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface  # Mount HF cache (writable)
     environment:
       - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}  # Pass HF_TOKEN from environment if set
     networks:
       - rag-network
     healthcheck:
