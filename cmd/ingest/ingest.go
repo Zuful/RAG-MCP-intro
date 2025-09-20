@@ -62,7 +62,7 @@ type StorageResponse struct {
 // loadDocuments appelle maintenant le microservice docparser.
 func loadDocuments(dir string, parserURL string) ([]Document, error) {
 	var documents []Document
-	client := &http.Client{}
+	client := &http.Client{Timeout: 60 * time.Second} // 1 minute for document parsing
 
 	fmt.Printf("   - Recherche de documents dans '%s' pour parsing via DocParser...\n", dir)
 
@@ -143,7 +143,7 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 
 // callEmbeddingService génère les embeddings via le service d'embedding
 func callEmbeddingService(texts []string, embeddingURL string) ([][]float32, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 300 * time.Second} // 5 minutes for embedding generation
 
 	fmt.Printf("   - Génération des embeddings pour %d documents via le service d'embedding...\n", len(texts))
 
