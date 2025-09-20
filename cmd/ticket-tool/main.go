@@ -8,5 +8,5 @@ import (
 func main() {
 	// On lance le serveur sur le port 8081 (pour ne pas entrer en conflit
 	// avec ChromaDB qui est sur 8000).
-	mcp.StartTicketToolServer("8081")
+	mcp.StartTicketToolServer("8083")
 }

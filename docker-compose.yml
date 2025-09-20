@@ -1,7 +1,7 @@
 services:
-  # ChromaDB - Vector Database
+  # ChromaDB - Vector Database (configured for external embeddings)
   chromadb:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:0.4.24  # Use specific stable version
     container_name: rag-chromadb
     ports:
       - "8000:8000"
@@ -12,6 +12,7 @@ services:
       - CHROMA_SERVER_HTTP_PORT=8000
       - ALLOW_RESET=TRUE
       - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
     networks:
       - rag-network
     # ChromaDB works fine, healthcheck has minor issues with curl availability
@@ -63,8 +64,7 @@ services:
       embedding-service:
         condition: service_healthy
     environment:
-      - CHROMA_HOST=chromadb
-      - CHROMA_PORT=8000
+      - CHROMA_DB_URL=http://chromadb:8000
       - EMBEDDING_SERVICE_HOST=embedding-service
       - EMBEDDING_SERVICE_PORT=5001
     networks:

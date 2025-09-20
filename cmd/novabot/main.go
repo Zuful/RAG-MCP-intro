@@ -239,7 +239,7 @@ func callOpenAI(userInput, ragContext string) (string, error) {
 // callCreateTicketTool (votre code, parfait et inchangé)
 func callCreateTicketTool(arguments string) error {
 	reqBody := bytes.NewBuffer([]byte(arguments))
-	resp, err := http.Post("http://localhost:8081/create-ticket", "application/json", reqBody)
+	resp, err := http.Post("http://localhost:8083/create-ticket", "application/json", reqBody)
 	if err != nil {
 		return err
 	}
