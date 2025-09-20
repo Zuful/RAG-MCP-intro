@@ -1,0 +1,118 @@
+services:
+  # ChromaDB - Vector Database
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: rag-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+    networks:
+      - rag-network
+    # ChromaDB works fine, healthcheck has minor issues with curl availability
+
+  # DocParser Service
+  docparser:
+    image: zuful/docparser:latest
+    container_name: rag-docparser
+    ports:
+      - "8080:8080"
+    networks:
+      - rag-network
+    # DocParser doesn't have a health endpoint, but the service starts quickly
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Embedding Service
+  embedding-service:
+    image: zuful/embedding-service:latest
+    container_name: rag-embedding-service
+    ports:
+      - "5001:5001"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface  # Mount HF cache (writable)
+    environment:
+      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Embeddingestion Service
+  embeddingestion:
+    image: zuful/embeddingestion:latest
+    container_name: rag-embeddingestion
+    ports:
+      - "8081:8081"
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - EMBEDDING_SERVICE_HOST=embedding-service
+      - EMBEDDING_SERVICE_PORT=5001
+    networks:
+      - rag-network
+    # Embeddingestion is a service that responds to requests but may not have a health endpoint
+    # We'll disable healthcheck for now since it's not critical for the orchestrator
+    # healthcheck:
+    #   test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8081"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 20s
+
+  # RAG Orchestrator (ingest service)
+  rag-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-orchestrator
+    depends_on:
+      docparser:
+        condition: service_started  # Service starts quickly
+      embedding-service:
+        condition: service_healthy  # This one has a working healthcheck
+      embeddingestion:
+        condition: service_started  # No healthcheck needed
+      chromadb:
+        condition: service_started  # Service works fine, healthcheck issues are minor
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - EMBEDDING_SERVICE_HOST=embedding-service
+      - EMBEDDING_SERVICE_PORT=5001
+      - DOCPARSER_SERVICE_HOST=docparser
+      - DOCPARSER_SERVICE_PORT=8080
+      - EMBEDDINGESTION_SERVICE_HOST=embeddingestion
+      - EMBEDDINGESTION_SERVICE_PORT=8081
+    volumes:
+      - ./data:/root/data:ro  # Mount data directory as read-only
+    networks:
+      - rag-network
+    # No ports exposed - this is an orchestrator that runs jobs
+    # If you want to expose it, uncomment the next lines:
+    # ports:
+    #   - "8082:8082"
+
+volumes:
+  chromadb_data:
+    driver: local
+
+networks:
+  rag-network:
+    driver: bridge
+  
