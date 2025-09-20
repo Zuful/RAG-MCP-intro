@@ -10,6 +10,8 @@ services:
     environment:
       - CHROMA_SERVER_HOST=0.0.0.0
       - CHROMA_SERVER_HTTP_PORT=8000
+      - ALLOW_RESET=TRUE
+      - IS_PERSISTENT=TRUE
     networks:
       - rag-network
     # ChromaDB works fine, healthcheck has minor issues with curl availability
