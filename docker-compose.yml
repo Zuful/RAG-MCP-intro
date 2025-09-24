@@ -1,37 +1,40 @@
 services:
-  # ChromaDB - Vector Database (configured for external embeddings)
-  chromadb:
-    image: chromadb/chroma:0.4.24  # Use specific stable version
-    container_name: rag-chromadb
+  # Qdrant - Vector Database
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    container_name: rag-qdrant
     ports:
-      - "8000:8000"
+      - "6333:6333"
+      - "6334:6334"
     volumes:
-      - chromadb_data:/chroma/chroma
+      - qdrant_data:/qdrant/storage
     environment:
-      - CHROMA_SERVER_HOST=0.0.0.0
-      - CHROMA_SERVER_HTTP_PORT=8000
-      - ALLOW_RESET=TRUE
-      - IS_PERSISTENT=TRUE
-      - ANONYMIZED_TELEMETRY=FALSE
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
     networks:
       - rag-network
-    # ChromaDB works fine, healthcheck has minor issues with curl availability
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # DocParser Service
-  docparser:
-    image: zuful/docparser:latest
-    container_name: rag-docparser
+  # Unstructured.io Document Parser Service
+  unstructured:
+    image: robwilkes/unstructured-api:latest  # ARM64 compatible image
+    container_name: rag-unstructured
     ports:
       - "8080:8080"
     networks:
       - rag-network
-    # DocParser doesn't have a health endpoint, but the service starts quickly
+    environment:
+      - UNSTRUCTURED_API_KEY=${UNSTRUCTURED_API_KEY:-}
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 60s  # Unstructured takes longer to start
 
   # Embedding Service
   embedding-service:
@@ -59,24 +62,22 @@ services:
     ports:
       - "8081:8081"
     depends_on:
-      chromadb:
-        condition: service_started  # ChromaDB has no healthcheck
+      qdrant:
+        condition: service_healthy
       embedding-service:
         condition: service_healthy
     environment:
-      - CHROMA_DB_URL=http://chromadb:8000
+      - QDRANT_URL=http://qdrant:6333
       - EMBEDDING_SERVICE_HOST=embedding-service
       - EMBEDDING_SERVICE_PORT=5001
     networks:
       - rag-network
-    # Embeddingestion is a service that responds to requests but may not have a health endpoint
-    # We'll disable healthcheck for now since it's not critical for the orchestrator
-    # healthcheck:
-    #   test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8081"]
-    #   interval: 30s
-    #   timeout: 10s
-    #   retries: 3
-    #   start_period: 20s
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   # RAG Orchestrator (ingest service)
   rag-orchestrator:
@@ -85,23 +86,20 @@ services:
       dockerfile: Dockerfile
     container_name: rag-orchestrator
     depends_on:
-      docparser:
-        condition: service_started  # Service starts quickly
+      unstructured:
+        condition: service_healthy  # Unstructured.io API
       embedding-service:
-        condition: service_healthy  # This one has a working healthcheck
+        condition: service_healthy  # Embedding generation
       embeddingestion:
-        condition: service_started  # No healthcheck needed
-      chromadb:
-        condition: service_started  # Service works fine, healthcheck issues are minor
+        condition: service_healthy  # Vector storage
+      qdrant:
+        condition: service_healthy  # Vector database
     environment:
-      - CHROMA_HOST=chromadb
-      - CHROMA_PORT=8000
-      - EMBEDDING_SERVICE_HOST=embedding-service
-      - EMBEDDING_SERVICE_PORT=5001
-      - DOCPARSER_SERVICE_HOST=docparser
-      - DOCPARSER_SERVICE_PORT=8080
-      - EMBEDDINGESTION_SERVICE_HOST=embeddingestion
-      - EMBEDDINGESTION_SERVICE_PORT=8081
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_URL=http://embedding-service:5001/embed
+      - DOC_PARSER_URL=http://unstructured:8080/parse  # Updated to Unstructured.io
+      - EMBEDDINGESTION_URL=http://embeddingestion:8081
+      - COLLECTION_NAME=novabot-rh
     volumes:
       - ./data:/root/data:ro  # Mount data directory as read-only
     networks:
@@ -112,7 +110,7 @@ services:
     #   - "8082:8082"
 
 volumes:
-  chromadb_data:
+  qdrant_data:
     driver: local
 
 networks:
