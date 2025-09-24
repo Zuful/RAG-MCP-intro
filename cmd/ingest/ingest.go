@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -21,10 +23,14 @@ type Document struct {
 	Metadata map[string]interface{}
 }
 
-// La structure de la réponse que nous attendons de notre service DocParser
-type DocParserResponse struct {
-	Content string `json:"content"`
+// Structure pour Unstructured.io API response
+type UnstructuredElement struct {
+	Type     string                 `json:"type"`
+	Text     string                 `json:"text"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
+
+type UnstructuredResponse []UnstructuredElement
 
 // Structure pour l'embedding service
 type EmbeddingRequest struct {
@@ -57,14 +63,219 @@ type StorageResponse struct {
 }
 
 // ------------------------------------------------------------------
+// TEXT CLEANING FUNCTIONS
+// ------------------------------------------------------------------
+
+// cleanText améliore la qualité du texte extrait pour de meilleurs embeddings
+func cleanText(text, filename string) string {
+	// Skip cleaning for markdown files (they're already clean)
+	if strings.HasSuffix(strings.ToLower(filename), ".md") {
+		return text
+	}
+
+	// Clean text for PDF and DOCX files
+	cleaned := text
+
+	// Remove excessive whitespace and normalize line breaks
+	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
+	cleaned = regexp.MustCompile(`\n\s*\n`).ReplaceAllString(cleaned, "\n\n")
+
+	// Remove leading/trailing whitespace from each line
+	lines := strings.Split(cleaned, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimSpace(line)
+	}
+	cleaned = strings.Join(lines, "\n")
+
+	// Remove empty lines
+	cleaned = regexp.MustCompile(`\n\n+`).ReplaceAllString(cleaned, "\n\n")
+
+	// Trim overall
+	cleaned = strings.TrimSpace(cleaned)
+
+	return cleaned
+}
+
+// chunkByTitle groups Unstructured.io elements by Title elements to create coherent chunks
+func chunkByTitle(elements UnstructuredResponse, filename, filePath string) []Document {
+	var chunks []Document
+	
+	// If no elements, return empty
+	if len(elements) == 0 {
+		return chunks
+	}
+	
+	// Collect document-level context (like filename, first title)
+	documentName := strings.TrimSuffix(filename, filepath.Ext(filename))
+	
+	// Create chunks by grouping content under titles
+	currentTitle := ""
+	var currentContent strings.Builder
+	chunkIndex := 0
+	
+	for _, element := range elements {
+		if element.Text == "" {
+			continue // Skip empty elements
+		}
+		
+		switch element.Type {
+		case "Title":
+			// Save the previous chunk if we have content
+			if currentContent.Len() > 0 {
+				chunk := createChunk(currentTitle, currentContent.String(), documentName, filename, filePath, chunkIndex)
+				if chunk.Text != "" { // Only add non-empty chunks
+					chunks = append(chunks, chunk)
+					chunkIndex++
+				}
+			}
+			
+			// Start new chunk with this title
+			currentTitle = element.Text
+			currentContent.Reset()
+			
+		case "NarrativeText":
+			// Add paragraph content
+			currentContent.WriteString(element.Text + "\n\n")
+			
+		case "ListItem":
+			// Add list item
+			currentContent.WriteString("• " + element.Text + "\n")
+			
+		case "Table":
+			// Add table content (Unstructured.io extracts table text)
+			currentContent.WriteString("\n[Table] " + element.Text + "\n\n")
+			
+		default:
+			// Other elements (Image, FigureCaption, etc.)
+			if element.Text != "" {
+				currentContent.WriteString(element.Text + "\n\n")
+			}
+		}
+	}
+	
+	// Don't forget the last chunk
+	if currentContent.Len() > 0 {
+		chunk := createChunk(currentTitle, currentContent.String(), documentName, filename, filePath, chunkIndex)
+		if chunk.Text != "" {
+			chunks = append(chunks, chunk)
+		}
+	}
+	
+	// If no title-based chunks were created (e.g., document without clear titles),
+	// create a single chunk with all content
+	if len(chunks) == 0 {
+		fallbackChunk := createFallbackChunk(elements, filename, filePath)
+		if fallbackChunk.Text != "" {
+			chunks = append(chunks, fallbackChunk)
+		}
+	}
+	
+	return chunks
+}
+
+// extractTopicFromPath extrait le topic depuis le chemin du fichier
+func extractTopicFromPath(filePath string) string {
+	// Obtenir le répertoire parent du fichier
+	dir := filepath.Dir(filePath)
+	
+	// Si c'est dans le répertoire racine, pas de topic spécifique
+	if dir == "." || dir == "./" {
+		return "general"
+	}
+	
+	// Extraire le nom du dossier (dernier élément du chemin)
+	topic := filepath.Base(dir)
+	
+	// Nettoyer le nom du topic (remplacer tirets par espaces, etc.)
+	topic = strings.ReplaceAll(topic, "-", " ")
+	topic = strings.ReplaceAll(topic, "_", " ")
+	
+	return topic
+}
+
+// createChunk builds a single chunk with title and content, including topic metadata
+func createChunk(title, content, documentName, filename, filePath string, chunkIndex int) Document {
+	var chunkBuilder strings.Builder
+	
+	// Extract topic from file path
+	topic := extractTopicFromPath(filePath)
+	
+	// Add document context with topic
+	chunkBuilder.WriteString(fmt.Sprintf("[Document: %s | Topic: %s]\n\n", documentName, topic))
+	
+	// Add title if we have one
+	if title != "" {
+		chunkBuilder.WriteString(fmt.Sprintf("# %s\n\n", title))
+	}
+	
+	// Add content
+	chunkBuilder.WriteString(strings.TrimSpace(content))
+	
+	// Clean the final text
+	finalText := cleanText(chunkBuilder.String(), filename)
+	
+	// Create unique ID for this chunk
+	chunkID := fmt.Sprintf("%s_%d", strings.TrimSuffix(filename, filepath.Ext(filename)), chunkIndex)
+	
+	return Document{
+		Text: finalText,
+		Metadata: map[string]interface{}{
+			"source":      filename,
+			"document":    documentName,
+			"title":       title,
+			"topic":       topic,
+			"chunk_index": chunkIndex,
+			"chunk_id":    chunkID,
+		},
+	}
+}
+
+// createFallbackChunk creates a single chunk when no clear title structure is found
+func createFallbackChunk(elements UnstructuredResponse, filename, filePath string) Document {
+	documentName := strings.TrimSuffix(filename, filepath.Ext(filename))
+	topic := extractTopicFromPath(filePath)
+	var contentBuilder strings.Builder
+	
+	contentBuilder.WriteString(fmt.Sprintf("[Document: %s | Topic: %s]\n\n", documentName, topic))
+	
+	for _, element := range elements {
+		if element.Text != "" {
+			switch element.Type {
+			case "Title":
+				contentBuilder.WriteString(fmt.Sprintf("# %s\n\n", element.Text))
+			case "NarrativeText":
+				contentBuilder.WriteString(element.Text + "\n\n")
+			case "ListItem":
+				contentBuilder.WriteString("• " + element.Text + "\n")
+			default:
+				contentBuilder.WriteString(element.Text + "\n\n")
+			}
+		}
+	}
+	
+	finalText := cleanText(contentBuilder.String(), filename)
+	
+	return Document{
+		Text: finalText,
+		Metadata: map[string]interface{}{
+			"source":      filename,
+			"document":    documentName,
+			"topic":       topic,
+			"chunk_index": 0,
+			"chunk_id":    documentName + "_0",
+		},
+	}
+}
+
+// ------------------------------------------------------------------
 // SEULE CETTE FONCTION EST REMPLACÉE
 // ------------------------------------------------------------------
-// loadDocuments appelle maintenant le microservice docparser.
+// loadDocuments appelle maintenant l'API Unstructured.io.
 func loadDocuments(dir string, parserURL string) ([]Document, error) {
 	var documents []Document
-	client := &http.Client{Timeout: 60 * time.Second} // 1 minute for document parsing
+	client := &http.Client{Timeout: 180 * time.Second} // 3 minutes for document parsing (PDFs can be large)
 
-	fmt.Printf("   - Recherche de documents dans '%s' pour parsing via DocParser...\n", dir)
+	fmt.Printf("   - Recherche de documents dans '%s' pour parsing via Unstructured.io...\n", dir)
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -74,7 +285,7 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 			return nil
 		}
 
-		fmt.Printf("      > Envoi du fichier '%s' au DocParser...\n", info.Name())
+		fmt.Printf("      > Envoi du fichier '%s' à Unstructured.io...\n", info.Name())
 
 		// 1. Ouvrir le fichier local
 		file, err := os.Open(path)
@@ -87,7 +298,7 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 		// 2. Préparer le corps de la requête HTTP (multipart/form-data)
 		var requestBody bytes.Buffer
 		writer := multipart.NewWriter(&requestBody)
-		part, err := writer.CreateFormFile("file", filepath.Base(path))
+		part, err := writer.CreateFormFile("files", filepath.Base(path)) // Note: 'files' not 'file'
 		if err != nil {
 			log.Printf("      ! AVERTISSEMENT: Impossible de préparer la requête pour %s, ignoré. Erreur: %v", info.Name(), err)
 			return nil
@@ -99,8 +310,10 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 		}
 		writer.Close()
 
-		// 3. Envoyer la requête au service DocParser
-		req, err := http.NewRequest("POST", parserURL, &requestBody)
+		// 3. Envoyer la requête à l'API Unstructured.io
+		// parserURL already contains the base URL (http://localhost:8080)
+		unstructuredURL := strings.TrimSuffix(parserURL, "/parse") + "/general/v0/general"
+		req, err := http.NewRequest("POST", unstructuredURL, &requestBody)
 		if err != nil {
 			log.Printf("      ! AVERTISSEMENT: Impossible de créer la requête HTTP pour %s, ignoré. Erreur: %v", info.Name(), err)
 			return nil
@@ -109,28 +322,30 @@ func loadDocuments(dir string, parserURL string) ([]Document, error) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("      ! AVERTISSEMENT: Echec de la connexion au DocParser pour %s, ignoré. Erreur: %v", info.Name(), err)
+			log.Printf("      ! AVERTISSEMENT: Echec de la connexion à Unstructured.io pour %s, ignoré. Erreur: %v", info.Name(), err)
 			return nil
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("      ! AVERTISSEMENT: Le DocParser a renvoyé une erreur (%s) pour le fichier %s, ignoré.", resp.Status, info.Name())
+			log.Printf("      ! AVERTISSEMENT: Unstructured.io a renvoyé une erreur (%s) pour le fichier %s, ignoré.", resp.Status, info.Name())
 			return nil
 		}
 
-		// 4. Décoder la réponse JSON et créer notre struct Document
-		var parsedResponse DocParserResponse
-		if err := json.NewDecoder(resp.Body).Decode(&parsedResponse); err != nil {
-			log.Printf("      ! AVERTISSEMENT: Réponse invalide du DocParser pour %s, ignoré. Erreur: %v", info.Name(), err)
+		// 4. Décoder la réponse Unstructured.io et créer notre struct Document
+		var unstructuredResponse UnstructuredResponse
+		if err := json.NewDecoder(resp.Body).Decode(&unstructuredResponse); err != nil {
+			log.Printf("      ! AVERTISSEMENT: Réponse invalide d'Unstructured.io pour %s, ignoré. Erreur: %v", info.Name(), err)
 			return nil
 		}
 
-		doc := Document{
-			Text:     parsedResponse.Content,
-			Metadata: map[string]interface{}{"source": info.Name()},
+		// 5. Chunk by title: Group content by titles for better contextual chunks
+		chunks := chunkByTitle(unstructuredResponse, info.Name(), path)
+		
+		// Add all chunks as separate documents
+		for _, chunk := range chunks {
+			documents = append(documents, chunk)
 		}
-		documents = append(documents, doc)
 		return nil
 	})
 

@@ -10,11 +10,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
-	// J'ai renommé votre import pour que ce soit plus clair et correspondre au dossier
-	embedders "github.com/Zuful/novabot/internal/embeddings"
-
-	chroma "github.com/amikos-tech/chroma-go/pkg/api/v2"
 	"github.com/joho/godotenv"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -25,28 +22,32 @@ const useOllamaLocal = true
 
 // ------------------------------------
 
-// --- VARIABLES GLOBALES (votre version) ---
-var chromaClient *chroma.Client
+// --- VARIABLES GLOBALES (mise à jour pour Qdrant) ---
+var qdrantURL string
+var ollamaURL string
+var httpClient *http.Client
+var embeddingServiceURL string
 var openaiClient *openai.Client // Gardé pour l'option OpenAI
-var collection chroma.Collection
 
 const collectionName = "novabot-rh"
 
-// setupClients (légèrement modifié pour ne charger la clé OpenAI que si nécessaire)
+// setupClients (mis à jour pour Qdrant)
 func setupClients() {
 	if err := godotenv.Load(".env"); err != nil {
 		log.Fatalf("Erreur chargement .env: %v", err)
 	}
-	chromaURL := os.Getenv("CHROMA_DB_URL")
-	if chromaURL == "" {
-		log.Fatal("CHROMA_DB_URL doit être défini")
+	qdrantURL = os.Getenv("QDRANT_URL")
+	if qdrantURL == "" {
+		qdrantURL = "http://localhost:6333" // Valeur par défaut
 	}
 
-	var err error
-	chromaClient, err := chroma.NewHTTPClient(chroma.WithBaseURL(chromaURL))
-	if err != nil {
-		log.Fatalf("Erreur client Chroma: %v", err)
+	ollamaURL = os.Getenv("OLLAMA_URL")
+	if ollamaURL == "" {
+		ollamaURL = "http://localhost:11434" // Valeur par défaut
 	}
+
+	// Initialiser le client HTTP
+	httpClient = &http.Client{Timeout: 30 * time.Second}
 
 	if !useOllamaLocal {
 		openaiAPIKey := os.Getenv("OPENAI_API_KEY")
@@ -56,17 +57,336 @@ func setupClients() {
 		openaiClient = openai.NewClient(openaiAPIKey)
 	}
 
-	embeddingFunc := embedders.NewGemmaEmbeddingFunction("http://localhost:5001/embed")
+	// Configurer l'URL du service d'embedding
+	embeddingServiceURL = "http://localhost:5001/embed"
 
-	collection, err = chromaClient.GetCollection(
-		context.Background(),
-		collectionName,
-		chroma.WithEmbeddingFunctionGet(embeddingFunc),
-	)
-	if err != nil {
-		log.Fatalf("Erreur pour récupérer la collection '%s': %v.\nAvez-vous bien lancé le script d'ingestion en premier ?", collectionName, err)
+	// Vérifier que la collection existe dans Qdrant
+	if err := checkQdrantCollection(); err != nil {
+		log.Fatalf("Erreur pour vérifier la collection '%s' dans Qdrant: %v.\nAvez-vous bien lancé le script d'ingestion en premier ?", collectionName, err)
 	}
-	fmt.Println("✅ Clients et connexion à la base de connaissances prêts.")
+	fmt.Println("✅ Clients et connexion à Qdrant prêts.")
+}
+
+// checkQdrantCollection vérifie que la collection existe dans Qdrant
+func checkQdrantCollection() error {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/collections/%s", qdrantURL, collectionName), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("collection '%s' n'existe pas dans Qdrant (status: %d)", collectionName, resp.StatusCode)
+	}
+
+	return nil
+}
+
+// QdrantSearchRequest représente une requête de recherche Qdrant avec support de filtrage
+type QdrantSearchRequest struct {
+	Vector      []float32              `json:"vector"`
+	Limit       int                    `json:"limit"`
+	WithPayload bool                   `json:"with_payload"`
+	Filter      map[string]interface{} `json:"filter,omitempty"`
+}
+
+// QdrantSearchResult représente le résultat d'une recherche Qdrant
+type QdrantSearchResult struct {
+	Result []struct {
+		ID      string                 `json:"id"`
+		Score   float64                `json:"score"`
+		Payload map[string]interface{} `json:"payload"`
+	} `json:"result"`
+}
+
+// generateEmbedding appelle le service d'embedding pour générer un embedding
+func generateEmbedding(text string) ([]float32, error) {
+	reqBody, err := json.Marshal(map[string][]string{"texts": {text}})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", embeddingServiceURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("erreur service embedding: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Embeddings [][]float32 `json:"embeddings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if len(result.Embeddings) == 0 {
+		return nil, fmt.Errorf("aucun embedding généré")
+	}
+
+	return result.Embeddings[0], nil
+}
+
+// getAvailableTopics récupère tous les topics disponibles dans la collection
+func getAvailableTopics() ([]string, error) {
+	// Récupérer un échantillon de documents pour extraire les topics
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/collections/%s/points/scroll", qdrantURL, collectionName), bytes.NewBuffer([]byte(`{"limit": 100, "with_payload": true}`)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Result struct {
+			Points []struct {
+				ID      string                 `json:"id"`
+				Payload map[string]interface{} `json:"payload"`
+			} `json:"points"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	// Extraire les topics uniques
+	topicsMap := make(map[string]bool)
+	for _, point := range result.Result.Points {
+		if topic, ok := point.Payload["topic"].(string); ok && topic != "" {
+			topicsMap[topic] = true
+		}
+	}
+
+	// Convertir en slice
+	topics := make([]string, 0, len(topicsMap))
+	for topic := range topicsMap {
+		topics = append(topics, topic)
+	}
+
+	return topics, nil
+}
+
+// analyzeQueryWithLLM utilise Gemma 3 pour analyser la requête et identifier les topics pertinents
+func analyzeQueryWithLLM(query string, availableTopics []string) ([]string, error) {
+	if len(availableTopics) == 0 {
+		return nil, nil // Pas de filtrage si pas de topics
+	}
+
+	// Créer le prompt pour l'analyse de topic
+	topicsStr := strings.Join(availableTopics, ", ")
+	analysisPrompt := fmt.Sprintf(`Analyze this user query and determine which topics are most relevant.
+
+User Query: "%s"
+
+Available Topics: %s
+
+Instructions:
+- Return ONLY the most relevant topic names from the available topics
+- If multiple topics are relevant, separate them with commas
+- If no topics are clearly relevant, return "none"
+- Be precise and only include topics that directly relate to the query
+
+Relevant topics:`, query, topicsStr)
+
+	// Debug: afficher les topics disponibles
+	fmt.Printf("[DEBUG LLM] Topics disponibles: %v\n", availableTopics)
+	fmt.Printf("[DEBUG LLM] Requête: %s\n", query)
+
+	// Appeler Ollama pour l'analyse
+	reqBody := map[string]interface{}{
+		"model":  "gemma3:12b", // Utiliser le modèle disponible
+		"prompt": analysisPrompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"temperature": 0.1, // Faible température pour plus de précision
+			"num_predict": 50,   // Limite la réponse
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", ollamaURL+"/api/generate", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	// Parser la réponse
+	response := strings.TrimSpace(result.Response)
+	fmt.Printf("[DEBUG LLM] Réponse du LLM: '%s'\n", response)
+	if response == "none" || response == "" {
+		return nil, nil
+	}
+
+	// Séparer les topics multiples et nettoyer
+	relevantTopics := []string{}
+	for _, topic := range strings.Split(response, ",") {
+		topic = strings.TrimSpace(topic)
+		// Vérifier que le topic existe dans la liste disponible
+		for _, availableTopic := range availableTopics {
+			if strings.EqualFold(topic, availableTopic) {
+				relevantTopics = append(relevantTopics, availableTopic)
+				break
+			}
+		}
+	}
+
+	return relevantTopics, nil
+}
+
+// createTopicFilter crée un filtre Qdrant basé sur les topics sélectionnés par le LLM
+func createTopicFilter(topics []string) map[string]interface{} {
+	if len(topics) == 0 {
+		return nil
+	}
+
+	// Si un seul topic
+	if len(topics) == 1 {
+		return map[string]interface{}{
+			"must": []map[string]interface{}{
+				{
+					"key":   "topic",
+					"match": map[string]interface{}{
+						"value": topics[0],
+					},
+				},
+			},
+		}
+	}
+
+	// Si plusieurs topics, utiliser "should" (OR logic)
+	shouldFilters := []map[string]interface{}{}
+	for _, topic := range topics {
+		shouldFilters = append(shouldFilters, map[string]interface{}{
+			"key": "topic",
+			"match": map[string]interface{}{
+				"value": topic,
+			},
+		})
+	}
+
+	return map[string]interface{}{
+		"should": shouldFilters,
+	}
+}
+
+func searchQdrant(query string, limit int) ([]string, []map[string]interface{}, error) {
+	// 1. Récupérer les topics disponibles
+	availableTopics, err := getAvailableTopics()
+	if err != nil {
+		fmt.Printf("[WARNING] Impossible de récupérer les topics: %v\n", err)
+	}
+
+	// 2. Analyser la requête avec le LLM pour identifier les topics pertinents
+	relevantTopics, err := analyzeQueryWithLLM(query, availableTopics)
+	if err != nil {
+		fmt.Printf("[WARNING] Erreur d'analyse LLM: %v\n", err)
+	}
+
+	// 3. Générer l'embedding pour la requête
+	embedding, err := generateEmbedding(query)
+	if err != nil {
+		return nil, nil, fmt.Errorf("erreur génération embedding: %w", err)
+	}
+
+	// 4. Créer le filtre basé sur les topics identifiés
+	topicFilter := createTopicFilter(relevantTopics)
+
+	// 5. Debug: afficher les informations de filtrage
+	if len(relevantTopics) > 0 {
+		fmt.Printf("[DEBUG TOPIC] Topics pertinents détectés: %v\n", relevantTopics)
+	} else {
+		fmt.Printf("[DEBUG TOPIC] Aucun filtrage par topic\n")
+	}
+
+	// 6. Préparer la requête de recherche avec filtrage
+	searchReq := QdrantSearchRequest{
+		Vector:      embedding,
+		Limit:       limit,
+		WithPayload: true,
+		Filter:      topicFilter,
+	}
+
+	jsonData, err := json.Marshal(searchReq)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Debug: Log the search request
+	fmt.Printf("[DEBUG SEARCH] Query: %s\n", query)
+	fmt.Printf("[DEBUG SEARCH] Request: %s\n", string(jsonData)[:200])
+
+	// Effectuer la recherche
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/collections/%s/points/search", qdrantURL, collectionName), bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("erreur recherche Qdrant: status %d", resp.StatusCode)
+	}
+
+	var result QdrantSearchResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, nil, err
+	}
+
+	// Extraire les textes et métadonnées
+	texts := make([]string, len(result.Result))
+	metadatas := make([]map[string]interface{}, len(result.Result))
+
+	for i, point := range result.Result {
+		if text, ok := point.Payload["text"].(string); ok {
+			texts[i] = text
+		} else {
+			texts[i] = "" // Texte vide si pas trouvé
+		}
+		metadatas[i] = point.Payload
+	}
+
+	return texts, metadatas, nil
 }
 
 func main() {
@@ -89,27 +409,40 @@ func main() {
 			break
 		}
 
-		// Phase RAG (votre code, parfait)
+		// Phase RAG (mis à jour pour Qdrant)
 		fmt.Println("NovaBot pense...")
-		results, err := collection.Query(
-			context.Background(),
-			chroma.WithQueryTexts(userInput),
-			chroma.WithNResults(2),
-		)
+		documents, metadatas, err := searchQdrant(userInput, 20) // Increase to capture lower-ranking relevant content
 		if err != nil {
 			log.Printf("Erreur de recherche RAG: %v", err)
 			continue
 		}
+		
+		// Debug temporaire pour Oselia
+		if strings.Contains(strings.ToLower(userInput), "oselia") {
+			fmt.Printf("[DEBUG OSELIA] Documents trouvés: %d\n", len(documents))
+			for i, meta := range metadatas {
+				if meta != nil {
+					fmt.Printf("[DEBUG] Doc %d - Source: %v\n", i+1, meta["source"])
+				}
+			}
+		}
+		
+		// Debug temporaire pour dotgo
+		if strings.Contains(strings.ToLower(userInput), "dotgo") {
+			fmt.Printf("[DEBUG DOTGO] Documents trouvés: %d\n", len(documents))
+			for i, meta := range metadatas {
+				if meta != nil {
+					fmt.Printf("[DEBUG] Doc %d - Source: %v\n", i+1, meta["source"])
+				}
+			}
+		}
 
 		var contextBuilder strings.Builder
-		if len(results.GetDocumentsGroups()) > 0 && len(results.GetDocumentsGroups()[0]) > 0 {
-			documents := results.GetDocumentsGroups()[0]
-			metadatas := results.GetMetadatasGroups()[0]
+		if len(documents) > 0 {
 			for i, docText := range documents {
 				source := "Source inconnue"
-				if i < len(metadatas) {
-					metadataObject := metadatas[i]
-					if val, ok := metadataObject.GetString("source"); ok {
+				if i < len(metadatas) && metadatas[i] != nil {
+					if val, ok := metadatas[i]["source"].(string); ok {
 						source = val
 					}
 				}
@@ -248,4 +581,12 @@ func callCreateTicketTool(arguments string) error {
 		return fmt.Errorf("l'outil MCP a renvoyé un statut d'erreur: %s", resp.Status)
 	}
 	return nil
+}
+
+// Helper function for debugging
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
